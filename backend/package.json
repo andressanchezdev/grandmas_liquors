@@ -1,0 +1,35 @@
+{
+  "name": "liqueur-sales-backend",
+  "version": "1.0.0",
+  "description": "Backend API for Liqueur Sales Management App",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js",
+    "migrate": "node run-migrations.js",
+    "db:data": "node run-db-data.js",
+    "test": "jest --detectOpenHandles",
+    "validate:crud": "node scripts/validate-crud.js"
+  },
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "bcryptjs": "^3.0.3",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-rate-limit": "^8.5.2",
+    "jsonwebtoken": "^9.0.2",
+    "multer": "^2.1.1",
+    "nodemailer": "^9.0.1",
+    "pg": "^8.11.3",
+    "sharp": "^0.33.0",
+    "winston": "^3.11.0",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2",
+    "puppeteer": "^24.43.1"
+  }
+}

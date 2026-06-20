@@ -1,0 +1,116 @@
+const express = require('express');
+const { wrapController } = require('../utils/wrapController');
+const controller = wrapController(require('../controllers/produccion.controllers'));
+const { authorizePermissions } = require('../middlewares/auth.middleware');
+const { productorProduccionGuard } = require('../middlewares/scopeAccess');
+const { validate } = require('../middlewares/validate.middleware');
+const { idParam, productorIdParam, productoIdParam } = require('../validators/params.schema');
+const {
+  createProduccionBody,
+  updateProduccionEstadoBody,
+  updateProduccionBody,
+  sugerirConsumoBody,
+} = require('../validators/produccion.schema');
+
+const router = express.Router();
+router.use(productorProduccionGuard);
+
+router.get('/', authorizePermissions('Ver Producción'), controller.getAll);
+router.get(
+  '/pedidos-disponibles',
+  authorizePermissions('Ver Producción', 'Registrar Producción'),
+  controller.getPedidosDisponibles
+);
+router.get(
+  '/pedido/:id',
+  authorizePermissions('Ver Producción', 'Registrar Producción'),
+  validate(idParam, 'params'),
+  controller.getPedidoParaOrden
+);
+router.get(
+  '/insumos-disponibles/:productorId',
+  authorizePermissions('Ver Producción'),
+  validate(productorIdParam, 'params'),
+  controller.getInsumosByProductor
+);
+router.get(
+  '/insumos-resumen/:productorId',
+  authorizePermissions('Ver Producción'),
+  validate(productorIdParam, 'params'),
+  controller.getInsumosResumenByProductor
+);
+router.get(
+  '/debug-insumos/:productorId',
+  authorizePermissions('Ver Producción'),
+  validate(productorIdParam, 'params'),
+  controller.debugInsumosByProductor
+);
+router.post(
+  '/sugerir-consumo',
+  authorizePermissions('Registrar Producción'),
+  validate(sugerirConsumoBody),
+  controller.sugerirConsumo
+);
+
+// Rutas para Fichas Técnicas — deben ir ANTES de /:id para que Express no las capture
+router.get(
+  '/ficha-tecnica/:productoId',
+  authorizePermissions('Ver Producción'),
+  validate(productoIdParam, 'params'),
+  controller.getFichaTecnica
+);
+router.post(
+  '/ficha-tecnica/:productoId',
+  authorizePermissions('Registrar Producción'),
+  validate(productoIdParam, 'params'),
+  controller.saveFichaTecnica
+);
+router.get(
+  '/ficha-tecnica/:productoId/calcular-insumos',
+  authorizePermissions('Ver Producción', 'Registrar Producción'),
+  validate(productoIdParam, 'params'),
+  controller.calcularInsumosNecesarios
+);
+router.get(
+  '/ficha-tecnica/:productoId/verificar-disponibilidad',
+  authorizePermissions('Ver Producción', 'Registrar Producción'),
+  validate(productoIdParam, 'params'),
+  controller.verificarDisponibilidadInsumos
+);
+
+router.get('/:id', authorizePermissions('Ver Producción'), validate(idParam, 'params'), controller.getById);
+router.post(
+  '/',
+  authorizePermissions('Registrar Producción', 'Ver Producción'),
+  validate(createProduccionBody),
+  controller.create
+);
+router.put(
+  '/:id',
+  authorizePermissions('Registrar Producción'),
+  validate(idParam, 'params'),
+  validate(updateProduccionBody),
+  controller.update
+);
+router.put(
+  '/:id/estado',
+  authorizePermissions('Ver Producción', 'Registrar Producción'),
+  validate(idParam, 'params'),
+  validate(updateProduccionEstadoBody),
+  controller.updateStatus
+);
+router.patch(
+  '/:id/estado',
+  authorizePermissions('Ver Producción', 'Registrar Producción'),
+  validate(idParam, 'params'),
+  validate(updateProduccionEstadoBody),
+  controller.updateStatus
+);
+router.delete(
+  '/:id',
+  authorizePermissions('Ver Producción'),
+  validate(idParam, 'params'),
+  controller.delete
+);
+
+module.exports = router;

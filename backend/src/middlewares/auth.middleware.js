@@ -1,0 +1,341 @@
+const jwt = require('jsonwebtoken');
+const config = require('../../config');
+const pool = require('../../db');
+const { roleGrantsPermission } = require('../models/shared/auditoria');
+const { getLatestUserStatusReason } = require('../models/shared/auditoria');
+const logger = require('../utils/logger');
+
+// ============================================================
+// VALIDADORES CENTRALIZADOS DE ENTRADA
+// ============================================================
+
+const validators = {
+  email: (value) => {
+    const email = String(value || '').trim().toLowerCase();
+    if (!email) return { valid: false, error: 'El correo es obligatorio' };
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) return { valid: false, error: 'El correo no es válido' };
+    return { valid: true, value: email };
+  },
+
+  password: (value) => {
+    const password = String(value || '').trim();
+    if (!password) return { valid: false, error: 'La contraseña es obligatoria' };
+    if (password.length < 6) return { valid: false, error: 'La contraseña debe tener al menos 6 caracteres' };
+    return { valid: true, value: password };
+  },
+
+  string: (value, fieldName = 'Campo', minLength = 1, maxLength = 500) => {
+    const str = String(value || '').trim();
+    if (minLength > 0 && str.length < minLength) {
+      return { valid: false, error: `${fieldName} debe tener al menos ${minLength} caracteres` };
+    }
+    if (str.length > maxLength) {
+      return { valid: false, error: `${fieldName} no puede exceder ${maxLength} caracteres` };
+    }
+    return { valid: true, value: str };
+  },
+
+  integer: (value, fieldName = 'Campo', min = Number.MIN_SAFE_INTEGER, max = Number.MAX_SAFE_INTEGER) => {
+    const num = Number(value);
+    if (!Number.isFinite(num)) return { valid: false, error: `${fieldName} debe ser un número entero` };
+    if (num < min || num > max) {
+      return { valid: false, error: `${fieldName} debe estar entre ${min} y ${max}` };
+    }
+    return { valid: true, value: num };
+  },
+
+  array: (value, fieldName = 'Campo', minItems = 0, maxItems = 1000) => {
+    if (!Array.isArray(value)) return { valid: false, error: `${fieldName} debe ser un array` };
+    if (value.length < minItems) {
+      return { valid: false, error: `${fieldName} debe tener al menos ${minItems} elementos` };
+    }
+    if (value.length > maxItems) {
+      return { valid: false, error: `${fieldName} no puede exceder ${maxItems} elementos` };
+    }
+    return { valid: true, value };
+  },
+
+  sanitize: (value) => {
+    // Remover caracteres peligrosos
+    if (typeof value !== 'string') return value;
+    return value
+      .replace(/[<>]/g, '') // Remover < y >
+      .replace(/--/g, '') // Remover comentarios SQL
+      .replace(/['";]/g, '') // Remover comillas peligrosas
+      .trim();
+  }
+};
+
+const getTokenFromRequest = (req) => {
+  const cookieToken = req.cookies?.[config.auth.cookieName];
+  if (cookieToken) return cookieToken;
+
+  const authHeader = req.headers.authorization || '';
+  if (authHeader.startsWith('Bearer ')) {
+    return authHeader.slice('Bearer '.length).trim();
+  }
+
+  return null;
+};
+
+const authenticateJWT = async (req, res, next) => {
+  try {
+    const token = getTokenFromRequest(req);
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No autenticado' });
+    }
+
+    const payload = jwt.verify(token, config.auth.jwtSecret, {
+      algorithms: ['HS256'],
+      issuer: config.auth.jwtIssuer,
+      audience: config.auth.jwtAudience,
+    });
+
+    const userId = Number(payload.sub || payload.id);
+    if (!Number.isFinite(userId)) {
+      return res.status(401).json({ success: false, message: 'Token invalido' });
+    }
+
+    const sessionJti = payload.jti || null;
+    if (!sessionJti) {
+      return res.status(401).json({ success: false, message: 'Sesion invalida. Inicia sesion nuevamente.' });
+    }
+
+    const { isUserSessionActive, touchUserSession, revokeUserSession } = require('../models/shared/auditoria');
+    const sessionActive = await isUserSessionActive(userId, sessionJti);
+    if (!sessionActive) {
+      const userStateResult = await pool.query(
+        'SELECT estado FROM usuarios WHERE id = $1 LIMIT 1',
+        [userId]
+      );
+      const currentState = String(userStateResult.rows[0]?.estado || '').trim();
+      if (currentState && currentState !== 'Activo') {
+        const latestReason = await getLatestUserStatusReason(userId, 'Inactivo').catch(() => null);
+        return res.status(401).json({
+          success: false,
+          message: latestReason
+            ? `Tu cuenta fue desactivada y tu sesión se cerró. Motivo: ${latestReason}`
+            : 'Tu cuenta fue desactivada y tu sesión se cerró.',
+        });
+      }
+      return res.status(401).json({ success: false, message: 'Sesion invalida o cerrada' });
+    }
+
+    const userResult = await pool.query(
+      `SELECT u.id,
+              u.email,
+              u.rol_id,
+              u.estado,
+              r.nombre AS rol,
+              c.id AS cliente_id
+       FROM usuarios u
+       LEFT JOIN roles r ON r.id = u.rol_id
+       LEFT JOIN clientes c ON c.usuario_id = u.id
+       WHERE u.id = $1
+       ORDER BY c.id DESC NULLS LAST
+       LIMIT 1`,
+      [userId]
+    );
+    const currentUser = userResult.rows[0];
+    if (!currentUser) {
+      await revokeUserSession(sessionJti).catch(() => {});
+      return res.status(401).json({ success: false, message: 'Sesion invalida. Inicia sesion nuevamente.' });
+    }
+
+    if (String(currentUser.estado || '').trim() !== 'Activo') {
+      await revokeUserSession(sessionJti).catch(() => {});
+      const latestReason = await getLatestUserStatusReason(userId, 'Inactivo').catch(() => null);
+      return res.status(401).json({
+        success: false,
+        message: latestReason
+          ? `Tu cuenta fue desactivada y tu sesión se cerró. Motivo: ${latestReason}`
+          : 'Tu cuenta fue desactivada y tu sesión se cerró.',
+      });
+    }
+
+    void touchUserSession(sessionJti);
+
+    req.user = {
+      id: userId,
+      rol: currentUser.rol || payload.rol,
+      rol_id: currentUser.rol_id || payload.rol_id,
+      cliente_id: currentUser.cliente_id || payload.cliente_id || null,
+      email: currentUser.email || payload.email,
+      session_jti: sessionJti,
+      session_expires_at_ms: typeof payload.exp === 'number' ? payload.exp * 1000 : null,
+    };
+
+    return next();
+  } catch (error) {
+    const message = error.name === 'TokenExpiredError' ? 'Sesion expirada' : 'Token invalido';
+    return res.status(401).json({ success: false, message });
+  }
+};
+
+const authorizeRoles = (...roles) => (req, res, next) => {
+  if (!req.user) {
+    return res.status(401).json({ success: false, message: 'No autenticado' });
+  }
+
+  if (!roles.includes(req.user.rol)) {
+    return res.status(403).json({ success: false, message: 'No autorizado' });
+  }
+
+  return next();
+};
+
+const CLIENT_API_PERMISSIONS = ['Cliente', 'Ver Mis Pedidos', 'Ver Tienda'];
+const PERMISSION_ALIASES = {
+  'Crear Compras': ['Registrar Compras'],
+  'Crear Ventas': ['Registrar Ventas'],
+  'Crear Abonos': ['Registrar Abonos'],
+  'Editar Domicilios': ['Gestionar Domicilios'],
+  'Eliminar Compras': ['Anular Compras'],
+  'Eliminar Ventas': ['Anular Ventas'],
+};
+
+const getEquivalentPermissions = (permission) => {
+  const aliases = PERMISSION_ALIASES[permission] || [];
+  return [permission, ...aliases];
+};
+
+// Middleware para validar permisos específicos basados en el rol del usuario
+const authorizePermissions = (...requiredPermissions) => async (req, res, next) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ success: false, message: 'No autenticado' });
+    }
+
+    // Administrador tiene acceso a todo
+    if (req.user.rol === 'Administrador') {
+      return next();
+    }
+
+    // Cliente: solo endpoints marcados para autoservicio / mis pedidos
+    if (req.user.rol === 'Cliente') {
+      const allowed = requiredPermissions.some((p) => CLIENT_API_PERMISSIONS.includes(p));
+      if (!allowed) {
+        return res.status(403).json({ success: false, message: 'No autorizado para acceder a este recurso' });
+      }
+      return next();
+    }
+
+    // Para otros roles, obtener los permisos del rol desde la BD
+    const roleResult = await pool.query(
+      'SELECT permisos FROM roles WHERE id = $1',
+      [req.user.rol_id]
+    );
+
+    const rol = roleResult.rows[0];
+    if (!rol) {
+      return res.status(403).json({ success: false, message: 'Rol no encontrado' });
+    }
+
+    const userPermissions = Array.isArray(rol.permisos) ? rol.permisos : [];
+
+    // Verificar permiso granular o acceso completo a la gestión que lo incluye
+    const hasPermission = requiredPermissions.some((perm) => roleGrantsPermission(userPermissions, perm));
+
+    if (!hasPermission) {
+      return res.status(403).json({
+        success: false,
+        message: 'No tienes permisos suficientes para acceder a este recurso',
+      });
+    }
+
+    return next();
+  } catch (error) {
+    logger.error('Error en authorizePermissions: ' + error);
+    return res.status(500).json({ success: false, message: 'Error al validar permisos' });
+  }
+};
+
+// Middleware de Rate Limiting para endpoints sensibles (persistido en BD).
+let rateLimitTableReady = false;
+
+const ensureRateLimitTable = async () => {
+  if (rateLimitTableReady) return;
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS api_rate_limit_log (
+      id BIGSERIAL PRIMARY KEY,
+      route_key VARCHAR(120) NOT NULL,
+      identifier VARCHAR(255) NOT NULL,
+      created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await pool.query(
+    'CREATE INDEX IF NOT EXISTS idx_api_rate_limit_route_identifier_created_at ON api_rate_limit_log (route_key, identifier, created_at)'
+  );
+  rateLimitTableReady = true;
+};
+
+const simpleRateLimit = (_maxRequests = 5, _windowMs = 15 * 60 * 1000, _routeKey = 'default') => {
+  if (process.env.RATE_LIMIT_ENABLED !== 'true') {
+    return (_req, _res, next) => next();
+  }
+
+  return async (req, res, next) => {
+    try {
+      await ensureRateLimitTable();
+
+      const routeKey = _routeKey;
+      const windowMs = _windowMs;
+      const maxRequests = _maxRequests;
+      const identifier = `${routeKey}:${req.ip || req.socket?.remoteAddress || 'unknown'}`;
+      const nowMs = Date.now();
+      const windowStart = new Date(nowMs - windowMs);
+
+      await pool.query(
+        `DELETE FROM api_rate_limit_log
+         WHERE route_key = $1 AND identifier = $2 AND created_at < $3`,
+        [routeKey, identifier, windowStart]
+      );
+
+      const countResult = await pool.query(
+        `SELECT COUNT(*)::int AS count
+         FROM api_rate_limit_log
+         WHERE route_key = $1 AND identifier = $2 AND created_at >= $3`,
+        [routeKey, identifier, windowStart]
+      );
+
+      const count = Number(countResult.rows[0]?.count || 0);
+      if (count >= maxRequests) {
+        const oldestResult = await pool.query(
+          `SELECT MIN(created_at) AS oldest
+           FROM api_rate_limit_log
+           WHERE route_key = $1 AND identifier = $2 AND created_at >= $3`,
+          [routeKey, identifier, windowStart]
+        );
+        const oldest = oldestResult.rows[0]?.oldest ? new Date(oldestResult.rows[0].oldest).getTime() : nowMs;
+        const resetIn = Math.max(1, Math.ceil((oldest + windowMs - nowMs) / 1000));
+        return res.status(429).json({
+          success: false,
+          message: `Demasiadas solicitudes. Intenta de nuevo en ${resetIn} segundos.`,
+          retryAfter: resetIn,
+        });
+      }
+
+      await pool.query(
+        'INSERT INTO api_rate_limit_log (route_key, identifier) VALUES ($1, $2)',
+        [routeKey, identifier]
+      );
+
+      return next();
+    } catch (error) {
+      console.error('Error en simpleRateLimit:', error);
+      return next();
+    }
+  };
+};
+
+const { authorizeAdministrador } = require('./scopeAccess');
+
+module.exports = {
+  authenticateJWT,
+  authorizeRoles,
+  authorizePermissions,
+  authorizeAdministrador,
+  simpleRateLimit,
+  validators,
+};
